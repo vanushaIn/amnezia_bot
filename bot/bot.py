@@ -9,6 +9,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# ---------- Конфигурация из переменных окружения ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN env variable is required")
@@ -19,14 +20,16 @@ VPN_API_URL = os.environ.get("VPN_API_URL", "http://127.0.0.1:5000")
 VPN_API_KEY = os.environ.get("VPN_API_KEY", "change_me")
 DB_PATH = os.environ.get("DB_PATH", "/etc/amnezia/vpn.db")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/home/vpn_clients")
+FAKE_PAYMENT = os.environ.get("FAKE_PAYMENT", "false").lower() == "true"
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище для отслеживания платежей: invoice_id -> (chat_id, client_name, months)
+# Хранилище для отслеживания реальных платежей (если FAKE_PAYMENT=false)
 pending_invoices = {}
 
+# ---------- Вспомогательные функции ----------
 def get_user_subscription(telegram_id):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
@@ -63,7 +66,7 @@ async def create_crypto_invoice(amount_usd, description, payload):
         "fiat": "USD",
         "description": description,
         "payload": payload,
-        "expires_in": 3600  # 1 час
+        "expires_in": 3600
     }
     async with aiohttp.ClientSession() as session:
         async with session.post(f"{CRYPTO_PAY_API}/createInvoice", headers=headers, json=data) as resp:
@@ -85,8 +88,7 @@ async def check_invoice_status(invoice_id):
             return "unknown"
 
 async def payment_poller(invoice_id, chat_id, client_name, months):
-    """Фоновая задача: опрашивает статус, при оплате активирует подписку"""
-    for _ in range(120):  # максимум 10 минут (120 * 5 сек)
+    for _ in range(120):
         await asyncio.sleep(5)
         status = await check_invoice_status(invoice_id)
         if status == "paid":
@@ -108,10 +110,10 @@ async def payment_poller(invoice_id, chat_id, client_name, months):
             await bot.send_message(chat_id, "⏰ Время оплаты истекло. Попробуйте снова /buy")
             del pending_invoices[invoice_id]
             return
-    # Таймаут
     await bot.send_message(chat_id, "⌛️ Превышено время ожидания оплаты.")
     del pending_invoices[invoice_id]
 
+# ---------- Обработчики команд ----------
 @dp.message(Command("start"))
 async def start(message: types.Message):
     sub = get_user_subscription(message.from_user.id)
@@ -124,19 +126,20 @@ async def start(message: types.Message):
     else:
         await message.answer(
             "Добро пожаловать! Здесь можно купить доступ к AmneziaWG VPN.\n"
-            "Для начала придумайте имя клиента (логин) и введите /buy <имя>"
+            "Для начала введите /buy или /buy <имя_клиента>"
         )
 
 @dp.message(Command("buy"))
 async def buy(message: types.Message):
-    if not CRYPTO_BOT_TOKEN:
+    if not CRYPTO_BOT_TOKEN and not FAKE_PAYMENT:
         await message.reply("💳 Платёжная система не настроена.")
         return
     args = message.text.split()
-    if len(args) != 2:
-        await message.reply("Используйте: /buy <имя_клиента>")
+    if len(args) > 2:
+        await message.reply("Используйте: /buy или /buy <имя_клиента>")
         return
-    client_name = args[1]
+    # Имя клиента: указано или генерируется из Telegram ID
+    client_name = args[1] if len(args) == 2 else f"client_{message.from_user.id}"
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="1 месяц - 10$", callback_data=f"tariff:1:{client_name}"),
@@ -150,14 +153,29 @@ async def buy(message: types.Message):
 
 @dp.callback_query(F.data.startswith("tariff:"))
 async def process_tariff(callback: types.CallbackQuery):
-    if not CRYPTO_BOT_TOKEN:
-        await callback.answer("Платёжная система не настроена", show_alert=True)
-        return
     _, months, client_name = callback.data.split(":")
     months = int(months)
+
+    # --- Фейковый платёж (для теста) ---
+    if FAKE_PAYMENT:
+        save_telegram_id(client_name, callback.from_user.id)
+        result = await call_api_create(client_name, months * 30)
+        if "error" in result:
+            await callback.answer(f"Ошибка: {result['error']}", show_alert=True)
+            return
+        config = result["config"]
+        file = io.BytesIO(config.encode())
+        file.name = f"{client_name}.conf"
+        await callback.message.answer_document(
+            types.BufferedInputFile(file.read(), filename=file.name),
+            caption=f"✅ (Тест) Подписка активирована до {result['paid_until']}"
+        )
+        await callback.answer()
+        return
+
+    # --- Реальный платёж через Crypto Pay ---
     prices = {1: 10, 3: 25, 6: 45}
     price = prices[months]
-
     try:
         invoice_id, pay_url = await create_crypto_invoice(
             amount_usd=price,
@@ -168,18 +186,13 @@ async def process_tariff(callback: types.CallbackQuery):
         await callback.answer(f"Ошибка создания счёта: {e}", show_alert=True)
         return
 
-    # Запоминаем платёж
     pending_invoices[invoice_id] = (callback.from_user.id, client_name, months)
-
-    # Кнопка оплаты
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="💳 Оплатить", url=pay_url))
     await callback.message.answer(
         f"Счёт на {price} USD создан. Нажмите «Оплатить» для перехода в @CryptoBot.",
         reply_markup=builder.as_markup()
     )
-
-    # Запускаем фоновую проверку
     asyncio.create_task(payment_poller(invoice_id, callback.from_user.id, client_name, months))
     await callback.answer()
 
