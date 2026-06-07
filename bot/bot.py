@@ -6,11 +6,9 @@ import sqlite3
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import LabeledPrice, PreCheckoutQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Обязательные переменные
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN env variable is required")
