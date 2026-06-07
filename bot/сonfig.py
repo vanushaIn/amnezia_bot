@@ -1,0 +1,5 @@
+BOT_TOKEN = "your_bot_token_here"
+CRYPTO_BOT_TOKEN = "your_crypto_token_here"
+VPN_API_URL = "http://127.0.0.1:5000"
+VPN_API_KEY = "your_api_key"
+DB_PATH = "/etc/amnezia/vpn.db"
